@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { EmptyState } from "@/components/empty-state";
+import { FileKnowledgePanel } from "@/components/file-knowledge-panel";
 import { PageHeader } from "@/components/page-header";
 import { TagInput } from "@/components/tag-input";
 import { Badge } from "@/components/ui/badge";
@@ -77,7 +78,8 @@ import {
 } from "@/lib/utils";
 
 type SourceLane = "knowledge" | "policydata";
-type SourceView = SourceLane | "reflection_memory";
+type SourceView = "library" | SourceLane | "reflection_memory";
+const DOCUMENT_PAGE_SIZE = 100;
 type SortOrder =
   | "time-desc"
   | "time-asc"
@@ -88,6 +90,11 @@ type SortOrder =
   | "status";
 
 const LANE_COPY: Record<SourceView, { label: string; description: string }> = {
+  library: {
+    label: "知识库文件",
+    description:
+      "按页浏览原文文件。搜索、文件夹和当前页上的查看、总结、重命名、移动、删除仍然可用。",
+  },
   knowledge: {
     label: "知识资料",
     description: "经相关性准入后恢复的事实、SDK 与领域参考。",
@@ -346,7 +353,8 @@ function withRetrievalCategory(content: string, category: string) {
 
 export function KnowledgePage() {
   const { language, locale } = useI18n();
-  const [lane, setLane] = useState<SourceView>("policydata");
+  const [lane, setLane] = useState<SourceView>("library");
+  const [docPage, setDocPage] = useState(0);
   const [listing, setListing] = useState<SourceListing>({ documents: [] });
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -389,8 +397,8 @@ export function KnowledgePage() {
   const mountedRef = useRef(false);
   const listRequestRef = useRef<AbortController | null>(null);
   const organizationRequestRef = useRef<AbortController | null>(null);
-  const viewRef = useRef({ lane, query });
-  viewRef.current = { lane, query };
+  const viewRef = useRef({ lane, query, sortOrder, selectedTag, docPage });
+  viewRef.current = { lane, query, sortOrder, selectedTag, docPage };
   const organizing =
     organization.status === "queued" || organization.status === "running";
 
@@ -400,10 +408,20 @@ export function KnowledgePage() {
       targetQuery = viewRef.current.query,
     ) => {
       if (!mountedRef.current || document.hidden) return;
+      if (targetView === "library") {
+        setLoading(false);
+        return;
+      }
       listRequestRef.current?.abort();
       const controller = new AbortController();
       listRequestRef.current = controller;
       setLoading(true);
+      const scope =
+        targetView === "reflection_memory"
+          ? "reflection"
+          : targetView === "knowledge"
+            ? "standard"
+            : "all";
       try {
         const [categoryListing, next] = await Promise.all([
           listDocumentCategories(controller.signal),
@@ -411,6 +429,14 @@ export function KnowledgePage() {
             storageLane(targetView),
             targetView === "policydata" ? "" : targetQuery,
             controller.signal,
+            {
+              limit: DOCUMENT_PAGE_SIZE,
+              offset: viewRef.current.docPage * DOCUMENT_PAGE_SIZE,
+              sort: viewRef.current.sortOrder,
+              tag:
+                targetView === "policydata" ? "" : viewRef.current.selectedTag,
+              scope,
+            },
           ),
         ]);
         if (controller.signal.aborted || !mountedRef.current) return;
@@ -544,39 +570,53 @@ export function KnowledgePage() {
     };
   }, [load, refreshOrganizationStatus]);
 
+  const docFilterKey = `${lane}|${query}|${selectedTag}|${sortOrder}`;
+  const [seenDocFilter, setSeenDocFilter] = useState(docFilterKey);
+  if (seenDocFilter !== docFilterKey) {
+    setSeenDocFilter(docFilterKey);
+    setDocPage(0);
+  }
+
   useEffect(() => {
     const timer = window.setTimeout(() => void load(lane, query), 250);
     return () => {
       window.clearTimeout(timer);
       listRequestRef.current?.abort();
     };
-  }, [lane, query, load]);
+  }, [docPage, lane, load, query, selectedTag, sortOrder]);
+
+  const serverPaged = typeof listing.total === "number";
 
   const viewDocuments = useMemo(
     () =>
-      listing.documents.filter((document) =>
-        lane === "reflection_memory"
-          ? isReflectionMemory(document)
-          : lane === "knowledge"
-            ? !isReflectionMemory(document)
-            : true,
-      ),
-    [lane, listing.documents],
+      serverPaged
+        ? listing.documents
+        : listing.documents.filter((document) =>
+            lane === "reflection_memory"
+              ? isReflectionMemory(document)
+              : lane === "knowledge"
+                ? !isReflectionMemory(document)
+                : true,
+          ),
+    [lane, listing.documents, serverPaged],
   );
 
   const allTags = useMemo(
     () =>
-      lane === "policydata"
-        ? []
-        : Array.from(
-            new Set(viewDocuments.flatMap((document) => document.tags || [])),
-          ).sort((left, right) =>
-            tagLabel(left).localeCompare(tagLabel(right), locale),
-          ),
-    [lane, locale, viewDocuments],
+      serverPaged
+        ? (listing.tags ?? [])
+        : lane === "policydata"
+          ? []
+          : Array.from(
+              new Set(viewDocuments.flatMap((document) => document.tags || [])),
+            ).sort((left, right) =>
+              tagLabel(left).localeCompare(tagLabel(right), locale),
+            ),
+    [lane, listing.tags, locale, serverPaged, viewDocuments],
   );
 
   const documents = useMemo(() => {
+    if (serverPaged) return listing.documents;
     const filtered = viewDocuments.filter((document) => {
       const tags = document.tags || [];
       if (lane !== "policydata" && selectedTag && !tags.includes(selectedTag))
@@ -615,7 +655,16 @@ export function KnowledgePage() {
       );
       return sortOrder === "path-desc" ? -result : result;
     });
-  }, [lane, locale, query, selectedTag, sortOrder, viewDocuments]);
+  }, [
+    lane,
+    listing.documents,
+    locale,
+    query,
+    selectedTag,
+    serverPaged,
+    sortOrder,
+    viewDocuments,
+  ]);
 
   const visiblePaths = documents.map((document) => document.relative_path);
   const allVisibleSelected =
@@ -628,16 +677,25 @@ export function KnowledgePage() {
     selectedPaths.has(document.relative_path),
   );
   const documentAdminReady =
+    serverPaged ||
     viewDocuments.length === 0 ||
     viewDocuments.every((document) => document.compile_status !== undefined);
-  const compiledCount = viewDocuments.filter(
-    (document) => document.compiled === true,
-  ).length;
-  const uncompiledCount = viewDocuments.filter(
-    (document) => document.compiled === false,
-  ).length;
-  const pendingRestartCount =
-    viewDocuments.length - compiledCount - uncompiledCount;
+  const compiledCount = serverPaged
+    ? (listing.compiled_count ?? 0)
+    : viewDocuments.filter((document) => document.compiled === true).length;
+  const uncompiledCount = serverPaged
+    ? (listing.uncompiled_count ?? 0)
+    : viewDocuments.filter((document) => document.compiled === false).length;
+  const totalDocuments = serverPaged
+    ? (listing.total ?? documents.length)
+    : viewDocuments.length;
+  const pendingRestartCount = serverPaged
+    ? Math.max(0, totalDocuments - compiledCount - uncompiledCount)
+    : viewDocuments.length - compiledCount - uncompiledCount;
+  const docPageCount = Math.max(
+    1,
+    Math.ceil(totalDocuments / DOCUMENT_PAGE_SIZE),
+  );
 
   const toggleAll = () => {
     setSelectedPaths((current) => {
@@ -905,16 +963,18 @@ export function KnowledgePage() {
       <PageHeader
         title={t("知识库")}
         description={
-          lane === "policydata"
-            ? t("人格文档只保留一份；保存后重新编译。")
-            : t("文档保存后进入未编译状态；可选择编译或全部编译。")
+          lane === "library"
+            ? t(LANE_COPY.library.description)
+            : lane === "policydata"
+              ? t("人格文档只保留一份；保存后重新编译。")
+              : t("文档保存后进入未编译状态；可选择编译或全部编译。")
         }
         actions={
-          lane === "reflection_memory" ? (
+          lane === "library" ? null : lane === "reflection_memory" ? (
             <Button
               variant="outline"
               size="sm"
-              disabled={organizing || viewDocuments.length < 2}
+              disabled={organizing || totalDocuments < 2}
               onClick={() => setOrganizeOpen(true)}
             >
               {organizing ? (
@@ -1006,6 +1066,7 @@ export function KnowledgePage() {
             onValueChange={(value) => setLane(value as SourceView)}
           >
             <TabsList>
+              <TabsTrigger value="library">{t("知识库文件")}</TabsTrigger>
               <TabsTrigger value="policydata">{t("人格文档")}</TabsTrigger>
               <TabsTrigger value="knowledge">{t("知识资料")}</TabsTrigger>
               <TabsTrigger value="reflection_memory">
@@ -1013,13 +1074,13 @@ export function KnowledgePage() {
               </TabsTrigger>
             </TabsList>
           </Tabs>
-          {lane !== "policydata" ? (
+          {lane !== "policydata" && lane !== "library" ? (
             <span className="text-xs text-muted-foreground">
               {t("已选 {count}", { count: formatNumber(selectedPaths.size) })}
             </span>
           ) : null}
         </div>
-        {lane !== "policydata" ? (
+        {lane !== "policydata" && lane !== "library" ? (
           <div className="flex flex-col gap-2 xl:flex-row xl:items-center">
             <div className="relative min-w-0 flex-1">
               <Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
@@ -1105,7 +1166,9 @@ export function KnowledgePage() {
         ) : null}
       </div>
 
-      {lane === "reflection_memory" ? (
+      {lane === "library" ? (
+        <FileKnowledgePanel />
+      ) : lane === "reflection_memory" ? (
         <div className="mb-4 space-y-4 border bg-muted/20 p-4">
           <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
             <div className="flex min-w-0 items-start gap-3">
@@ -1188,6 +1251,8 @@ export function KnowledgePage() {
         </div>
       ) : null}
 
+      {lane !== "library" ? (
+      <>
       {lane !== "policydata" && allTags.length ? (
         <div className="mb-4 flex flex-wrap items-center gap-1.5">
           <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
@@ -1235,7 +1300,7 @@ export function KnowledgePage() {
             <div>
               <span className="text-muted-foreground">{t("文档")}</span>
               <strong className="ml-2">
-                {formatNumber(viewDocuments.length)}
+                {formatNumber(totalDocuments)}
               </strong>
             </div>
             <div>
@@ -1451,6 +1516,36 @@ export function KnowledgePage() {
           )}
         </CardContent>
       </Card>
+      {serverPaged && totalDocuments > DOCUMENT_PAGE_SIZE ? (
+        <div className="mt-3 flex flex-wrap items-center justify-end gap-2 text-xs text-muted-foreground">
+          <span className="font-mono">
+            {t("第 {page} / {pages} 页", {
+              page: formatNumber(Math.min(docPage, docPageCount - 1) + 1),
+              pages: formatNumber(docPageCount),
+            })}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={docPage <= 0 || loading}
+            onClick={() => setDocPage((index) => Math.max(0, index - 1))}
+          >
+            {t("上一页")}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={docPage >= docPageCount - 1 || loading}
+            onClick={() =>
+              setDocPage((index) => Math.min(docPageCount - 1, index + 1))
+            }
+          >
+            {t("下一页")}
+          </Button>
+        </div>
+      ) : null}
+      </>
+      ) : null}
 
       <Dialog open={categoryOpen} onOpenChange={setCategoryOpen}>
         <DialogContent className="max-w-3xl">

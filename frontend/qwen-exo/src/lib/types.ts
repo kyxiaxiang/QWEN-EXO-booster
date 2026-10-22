@@ -154,6 +154,177 @@ export type SourceListing = {
   source_digest?: string;
   document_count?: number;
   documents: SourceDocument[];
+  /** Present when the server returned one page instead of the whole corpus. */
+  total?: number;
+  offset?: number;
+  limit?: number | null;
+  compiled_count?: number;
+  uncompiled_count?: number;
+  tags?: string[];
+};
+
+/** One file in the server-side knowledge base (searched by memory tools). */
+export type KnowledgeFile = {
+  relative_path: string;
+  sha256: string;
+  byte_count: number;
+  mtime_ns: number;
+  encoding: string;
+  line_count: number;
+  indexed_ns: number;
+  schema_version?: number;
+  kind: KnowledgeFileKind;
+  title: string;
+  summary: KnowledgeFileSummaryInfo | null;
+};
+
+export type KnowledgeFileKind =
+  | "summary"
+  | "note"
+  | "code"
+  | "other"
+  | "data"
+  | "log"
+  | "session"
+  | "trajectory"
+  | "work";
+
+export type KnowledgeFileSummaryInfo = {
+  title: string;
+  origin: "auto" | "manual";
+  sampled: boolean;
+  updated_ns: number;
+  stale: boolean;
+};
+
+export type KnowledgeDirectoryCount = {
+  files: number;
+  bytes: number;
+};
+
+/** Folder tree plus counts. File rows are loaded per page, not here. */
+export type KnowledgeTree = {
+  directories: string[];
+  counts: Record<string, KnowledgeDirectoryCount>;
+  areas: {
+    imported: KnowledgeDirectoryCount;
+    work: KnowledgeDirectoryCount;
+  };
+};
+
+export type KnowledgeFilePage = {
+  files: KnowledgeFile[];
+  total: number;
+  total_bytes: number;
+  offset: number;
+  limit: number;
+};
+
+export type KnowledgeMoveResult = {
+  from: string;
+  to: string;
+  files: number;
+};
+
+export type KnowledgeSummaryStatus = {
+  available: boolean;
+  queued?: string[];
+  current?: {
+    path: string;
+    chunks: number;
+    done: number;
+    sampled: boolean;
+  } | null;
+  missing?: number;
+  completed?: number;
+  failed?: { path: string; error: string }[];
+};
+
+export type KnowledgeSummaryRecord = {
+  relative_path: string;
+  sha256: string;
+  title: string;
+  summary: string;
+  sampled: boolean;
+  origin: "auto" | "manual";
+  updated_ns: number;
+};
+
+export type KnowledgeSearchResult = {
+  path: string;
+  line: number;
+  line_start_offset: number;
+  text: string;
+  line_text: string;
+  before: string[];
+  after: string[];
+};
+
+export type KnowledgeSearchResponse = {
+  results: KnowledgeSearchResult[];
+  count: number;
+  truncated: boolean;
+};
+
+export type KnowledgeReadResponse = {
+  path: string;
+  offset: number;
+  end_offset: number;
+  total_bytes: number;
+  text: string;
+  eof: boolean;
+};
+
+export type DreamTrigger = "nightly" | "manual";
+export type DreamRunStatus =
+  | "running"
+  | "completed"
+  | "stopped"
+  | "failed"
+  | "cancelled";
+export type DreamActionKind = "write" | "move" | "delete" | "mkdir";
+
+export type DreamAction = {
+  step: number;
+  action: DreamActionKind | string;
+  target: string;
+  to?: string | null;
+  ok: boolean;
+  message?: string | null;
+};
+
+export type DreamRunSummary = {
+  id: number;
+  trigger: DreamTrigger | string;
+  started_ns: number;
+  finished_ns: number | null;
+  status: DreamRunStatus | string;
+  steps: number;
+  summary: string;
+  action_count: number;
+};
+
+export type DreamRunDetail = Omit<DreamRunSummary, "action_count"> & {
+  action_count?: number;
+  actions: DreamAction[];
+};
+
+export type DreamStatus = {
+  available: boolean;
+  running?: boolean;
+  current?: {
+    run_id: number;
+    step: number;
+    last_action: DreamAction | null;
+  } | null;
+  next_run_in_seconds?: number;
+  runs?: DreamRunSummary[];
+};
+
+export type WorkTrashEntry = {
+  batch: string;
+  path: string;
+  bytes: number;
 };
 
 export type DocumentCategory = {

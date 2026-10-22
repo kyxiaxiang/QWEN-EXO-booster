@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Literal
 
@@ -76,6 +78,35 @@ class KnowledgeUploadItem(BaseModel):
 
 class KnowledgeIngestRequest(BaseModel):
     files: list[KnowledgeUploadItem] = Field(min_length=1, max_length=20)
+
+
+class KnowledgeFileUploadRequest(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=1024)
+    content_base64: str = Field(min_length=1)
+
+
+class KnowledgeArchiveUploadRequest(BaseModel):
+    content_base64: str = Field(min_length=1)
+    target_directory: str = Field(default="", max_length=512)
+
+
+class KnowledgeFolderRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+
+
+class KnowledgeMoveRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=1024)
+    destination: str = Field(min_length=1, max_length=1024)
+
+
+class KnowledgeSummaryWriteRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    summary: str = Field(min_length=1, max_length=200_000)
+
+
+class KnowledgeSummaryGenerateRequest(BaseModel):
+    paths: list[str] = Field(default_factory=list, max_length=10_000)
+    force: bool = False
 
 
 class DocumentCategoryWriteRequest(BaseModel):
@@ -609,22 +640,382 @@ async def telemetry_stream(
 
 
 @router.get("/knowledge")
-async def list_knowledge(request: Request, q: str = Query(default="", max_length=256)):
+async def list_knowledge(
+    request: Request,
+    q: str = Query(default="", max_length=256),
+    limit: int | None = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    sort: str = Query(default="time-desc", max_length=32),
+    tag: str = Query(default="", max_length=64),
+    folder: str = Query(default="", max_length=1024),
+    nested: bool = Query(default=True),
+    scope: str = Query(default="all", max_length=32),
+):
     runtime = _runtime(request)
-    return {
-        "source_digest": runtime.knowledge.snapshot.source_digest,
-        "documents": runtime.knowledge_documents(query=q),
-    }
+    # Unpaged callers (and the existing tests) still receive the full listing.
+    # The console always sends ``limit`` so a large corpus is one page.
+    if (
+        limit is None
+        and offset == 0
+        and not tag
+        and not folder
+        and scope == "all"
+        and sort == "time-desc"
+    ):
+        return {
+            "source_digest": runtime.knowledge.snapshot.source_digest,
+            "documents": runtime.knowledge_documents(query=q),
+        }
+    listing = getattr(runtime, "knowledge_listing", None)
+    if listing is None:
+        documents = runtime.knowledge_documents(query=q)
+        page = documents[offset : offset + limit] if limit is not None else documents
+        return {
+            "source_digest": runtime.knowledge.snapshot.source_digest,
+            "documents": page,
+            "total": len(documents),
+            "offset": offset,
+            "limit": limit,
+        }
+    return listing(
+        query=q,
+        limit=100 if limit is None else limit,
+        offset=offset,
+        sort=sort,
+        tag=tag,
+        folder=folder,
+        nested=nested,
+        scope=scope,
+    )
+
+
+def _knowledge_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, FileNotFoundError):
+        return HTTPException(status_code=404, detail="知识库文件或文件夹不存在")
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+async def _spool_body(request: Request, directory: Path):
+    """Stream a raw upload body to a temporary file. The caller deletes it."""
+    from qwen_exo_booster.file_knowledge import FileKnowledgeError, ensure_free_space
+
+    declared = request.headers.get("content-length")
+    try:
+        ensure_free_space(directory, int(declared) if declared and declared.isdigit() else 0)
+    except FileKnowledgeError as exc:
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+    directory.mkdir(parents=True, exist_ok=True)
+    spool = tempfile.NamedTemporaryFile(dir=directory, prefix=".upload-", delete=False)
+    written = 0
+    try:
+        async for chunk in request.stream():
+            spool.write(chunk)
+            written += len(chunk)
+            if written // (256 * 1024 * 1024) != (written - len(chunk)) // (256 * 1024 * 1024):
+                try:
+                    ensure_free_space(directory)
+                except FileKnowledgeError as exc:
+                    raise HTTPException(status_code=507, detail=str(exc)) from exc
+        spool.flush()
+        spool.seek(0)
+        return spool
+    except BaseException:
+        spool.close()
+        Path(spool.name).unlink(missing_ok=True)
+        raise
+
+
+@router.get("/knowledge/files")
+async def list_knowledge_files(
+    request: Request,
+    folder: str = Query(default="", max_length=1024),
+    nested: bool = Query(default=True),
+    q: str = Query(default="", max_length=256),
+    area: str = Query(default="all", max_length=32),
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """One page of file metadata. The corpus root is ``folder=""``.
+
+    Later pages skip the filesystem refresh so paging stays a SQL read.
+    ``/knowledge/tree`` and the first page of a query still refresh.
+    """
+    index = _runtime(request).file_knowledge
+    if offset == 0:
+        await asyncio.to_thread(index.refresh)
+    try:
+        return await asyncio.to_thread(
+            index.page_files,
+            folder=folder,
+            nested=nested,
+            query=q,
+            area=area,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as exc:
+        raise _knowledge_error(exc) from exc
+
+
+@router.get("/knowledge/tree")
+async def knowledge_tree(request: Request):
+    """Directories and recursive counts only. File rows are paged separately."""
+    index = _runtime(request).file_knowledge
+    await asyncio.to_thread(index.refresh)
+    return await asyncio.to_thread(index.directory_summary)
+
+
+@router.post("/knowledge/files")
+async def upload_knowledge_file(payload: KnowledgeFileUploadRequest, request: Request):
+    from qwen_exo_booster.file_knowledge import validate_text_upload
+
+    try:
+        raw = base64.b64decode(payload.content_base64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    index = _runtime(request).file_knowledge
+    try:
+        validate_text_upload(raw)
+        row = await asyncio.to_thread(index.upsert, payload.relative_path, raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"file": row}
+
+
+@router.post("/knowledge/upload")
+async def upload_knowledge_file_raw(
+    request: Request, path: str = Query(min_length=1, max_length=1024)
+):
+    index = _runtime(request).file_knowledge
+    spool = await _spool_body(request, index.root)
+    try:
+        with spool:
+            row = await asyncio.to_thread(index.store_upload, path, spool)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        Path(spool.name).unlink(missing_ok=True)
+    return {"file": row}
+
+
+@router.post("/knowledge/upload-archive")
+async def upload_knowledge_archive_raw(
+    request: Request, target_directory: str = Query(default="", max_length=512)
+):
+    index = _runtime(request).file_knowledge
+    spool = await _spool_body(request, index.root)
+    try:
+        with spool:
+            imported, skipped = await asyncio.to_thread(
+                index.import_archive, spool, directory=target_directory
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        Path(spool.name).unlink(missing_ok=True)
+    return {"files": imported, "skipped": skipped}
+
+
+@router.post("/knowledge/archives")
+async def upload_knowledge_archive(
+    payload: KnowledgeArchiveUploadRequest, request: Request
+):
+    try:
+        raw = base64.b64decode(payload.content_base64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    index = _runtime(request).file_knowledge
+    try:
+        imported, skipped = await asyncio.to_thread(
+            index.import_archive, raw, directory=payload.target_directory
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"files": imported, "skipped": skipped}
+
+
+@router.post("/knowledge/folders")
+async def create_knowledge_folder(payload: KnowledgeFolderRequest, request: Request):
+    try:
+        path = await asyncio.to_thread(
+            _runtime(request).file_knowledge.make_directory, payload.path
+        )
+    except (ValueError, OSError) as exc:
+        raise _knowledge_error(exc) from exc
+    return {"path": path}
+
+
+@router.delete("/knowledge/folders/{path:path}")
+async def delete_knowledge_folder(path: str, request: Request):
+    try:
+        removed = await asyncio.to_thread(
+            _runtime(request).file_knowledge.delete_directory, path
+        )
+    except (ValueError, OSError) as exc:
+        raise _knowledge_error(exc) from exc
+    return {"deleted": True, "path": path, "files": removed}
+
+
+@router.post("/knowledge/move")
+async def move_knowledge_entry(payload: KnowledgeMoveRequest, request: Request):
+    try:
+        return await asyncio.to_thread(
+            _runtime(request).file_knowledge.move, payload.source, payload.destination
+        )
+    except (ValueError, OSError) as exc:
+        raise _knowledge_error(exc) from exc
+
+
+@router.get("/knowledge/summaries")
+async def knowledge_summary_status(request: Request):
+    """Automatic summary generation is not wired in this runtime."""
+    del request
+    return {"available": False, "queued": [], "current": None, "missing": 0, "completed": 0, "failed": []}
+
+
+@router.get("/knowledge/summary")
+async def read_knowledge_summary(
+    request: Request, path: str = Query(min_length=1, max_length=1024)
+):
+    try:
+        summary = await asyncio.to_thread(_runtime(request).file_knowledge.summary, path)
+    except ValueError as exc:
+        raise _knowledge_error(exc) from exc
+    if summary is None:
+        raise HTTPException(status_code=404, detail="这个文件还没有总结")
+    return summary
+
+
+@router.put("/knowledge/summary")
+async def write_knowledge_summary(payload: KnowledgeSummaryWriteRequest, request: Request):
+    index = _runtime(request).file_knowledge
+    try:
+        sha256, _text = await asyncio.to_thread(index.read_text, payload.path)
+        return await asyncio.to_thread(
+            index.store_summary,
+            payload.path,
+            sha256=sha256,
+            summary=payload.summary,
+            sampled=False,
+            origin="manual",
+        )
+    except ValueError as exc:
+        raise _knowledge_error(exc) from exc
+
+
+@router.delete("/knowledge/summary")
+async def delete_knowledge_summary(
+    request: Request, path: str = Query(min_length=1, max_length=1024)
+):
+    try:
+        deleted = await asyncio.to_thread(
+            _runtime(request).file_knowledge.delete_summary, path
+        )
+    except ValueError as exc:
+        raise _knowledge_error(exc) from exc
+    return {"deleted": deleted}
+
+
+@router.post("/knowledge/summaries/generate", status_code=202)
+async def generate_knowledge_summaries(
+    payload: KnowledgeSummaryGenerateRequest, request: Request
+):
+    del payload, request
+    raise HTTPException(
+        status_code=409,
+        detail="总结服务不可用（需要已加载模型的分词器）。可以手动编写总结。",
+    )
+
+
+@router.delete("/knowledge/files/{relative_path:path}")
+async def delete_knowledge_file(relative_path: str, request: Request):
+    try:
+        await asyncio.to_thread(_runtime(request).file_knowledge.delete, relative_path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="知识库文件不存在")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"deleted": True, "relative_path": relative_path}
+
+
+@router.get("/knowledge/search")
+async def search_knowledge_files(
+    request: Request,
+    pattern: str = Query(min_length=1, max_length=4096),
+    path_glob: str = Query(default="**/*", min_length=1, max_length=1024),
+    case_sensitive: bool = Query(default=False),
+    regex: bool = Query(default=False),
+    max_results: int = Query(default=50, ge=1, le=1000),
+    context_before: int = Query(default=0, ge=0, le=20),
+    context_after: int = Query(default=0, ge=0, le=20),
+):
+    index = _runtime(request).file_knowledge
+    try:
+        return await asyncio.to_thread(
+            index.search,
+            pattern,
+            path_glob=path_glob,
+            case_sensitive=case_sensitive,
+            regex=regex,
+            max_results=max_results,
+            context_before=context_before,
+            context_after=context_after,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/knowledge/read")
+async def read_knowledge_file(
+    request: Request,
+    path: str = Query(min_length=1, max_length=1024),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=65536, ge=1, le=1_048_576),
+):
+    index = _runtime(request).file_knowledge
+    try:
+        return await asyncio.to_thread(index.read, path, offset=offset, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/memory/dream")
+async def memory_dream_status(request: Request):
+    del request
+    return {"available": False}
+
+
+@router.post("/memory/dream/run", status_code=202)
+async def run_memory_dream(request: Request):
+    del request
+    raise HTTPException(status_code=409, detail="记忆整理不可用（服务端未启用或模型未就绪）。")
+
+
+@router.get("/memory/work-trash")
+async def work_memory_trash(request: Request):
+    del request
+    return {"entries": []}
+
+
+@router.post("/memory/work-trash/restore")
+async def restore_work_memory(request: Request):
+    del request
+    raise HTTPException(status_code=409, detail="记忆整理不可用（服务端未启用或模型未就绪）。")
 
 
 @router.get("/policydata")
 async def list_policy_data(
-    request: Request, q: str = Query(default="", max_length=256)
+    request: Request,
+    q: str = Query(default="", max_length=256),
+    limit: int | None = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    sort: str = Query(default="time-desc", max_length=32),
+    tag: str = Query(default="", max_length=64),
+    folder: str = Query(default="", max_length=1024),
+    nested: bool = Query(default=True),
 ):
     runtime = _runtime(request)
-    return {
-        "source_digest": runtime.policy_data.snapshot.source_digest,
-        "documents": runtime.policy_data_documents(query=q),
+    extras = {
         "always_on": bool(
             runtime.config.feature_flags.policy_data
             and getattr(runtime.policy_data.snapshot, "documents", ())
@@ -635,6 +1026,35 @@ async def list_policy_data(
         "route": "attention_q_native_tensor_bank",
         "max_tokens": runtime.config.max_policy_tokens,
     }
+    if limit is None and offset == 0 and not tag and not folder and sort == "time-desc":
+        return {
+            "source_digest": runtime.policy_data.snapshot.source_digest,
+            "documents": runtime.policy_data_documents(query=q),
+            **extras,
+        }
+    listing = getattr(runtime, "policy_data_listing", None)
+    if listing is None:
+        documents = runtime.policy_data_documents(query=q)
+        page = documents[offset : offset + limit] if limit is not None else documents
+        return {
+            "source_digest": runtime.policy_data.snapshot.source_digest,
+            "documents": page,
+            "total": len(documents),
+            "offset": offset,
+            "limit": limit,
+            **extras,
+        }
+    payload = listing(
+        query=q,
+        limit=100 if limit is None else limit,
+        offset=offset,
+        sort=sort,
+        tag=tag,
+        folder=folder,
+        nested=nested,
+    )
+    payload.update(extras)
+    return payload
 
 
 class TrajectoryWriteRequest(BaseModel):

@@ -58,10 +58,12 @@ from qwen_exo_booster.fingerprint import ModelIdentity
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
 from qwen_exo_booster.internal_jobs import InternalJobRunner
 from qwen_exo_booster.judge import ReferenceJudge
+from qwen_exo_booster.file_knowledge import FileKnowledgeIndex
 from qwen_exo_booster.knowledge import (
     KnowledgeDocument,
     KnowledgeRepository,
     is_compatible_reflection_memory,
+    is_reflection_memory_document,
     set_markdown_retrieval_category,
 )
 from qwen_exo_booster.latent_transplant import (
@@ -376,6 +378,11 @@ class QwenExoRuntime:
         self.tokenizer_manager = tokenizer_manager
         self.hybrid_policy = hybrid_policy
         self.knowledge = KnowledgeRepository(config.knowledge_directory)
+        # File index for the console browser. Metadata lives in SQLite; file
+        # bytes stay on disk and are not loaded until a page or a read asks.
+        self.file_knowledge = FileKnowledgeIndex(
+            config.knowledge_directory, config.state_directory
+        )
         self.document_categories = DocumentCategoryStore(
             config.state_directory / "document-categories.sqlite3"
         )
@@ -8560,6 +8567,225 @@ class QwenExoRuntime:
             include_content=include_content,
             query=query,
         )
+
+    def knowledge_listing(
+        self,
+        *,
+        query: str = "",
+        limit: int = 100,
+        offset: int = 0,
+        sort: str = "time-desc",
+        tag: str = "",
+        folder: str = "",
+        nested: bool = True,
+        scope: str = "standard",
+    ) -> dict[str, object]:
+        """One page of knowledge documents plus totals for the filtered corpus."""
+        payload = self._paged_source_documents(
+            "knowledge",
+            self.knowledge,
+            query=query,
+            limit=limit,
+            offset=offset,
+            sort=sort,
+            tag=tag,
+            folder=folder,
+            nested=nested,
+            scope=scope,
+        )
+        payload["source_digest"] = self.knowledge.snapshot.source_digest
+        return payload
+
+    def policy_data_listing(
+        self,
+        *,
+        query: str = "",
+        limit: int = 100,
+        offset: int = 0,
+        sort: str = "time-desc",
+        tag: str = "",
+        folder: str = "",
+        nested: bool = True,
+    ) -> dict[str, object]:
+        payload = self._paged_source_documents(
+            "policydata",
+            self.policy_data,
+            query=query,
+            limit=limit,
+            offset=offset,
+            sort=sort,
+            tag=tag,
+            folder=folder,
+            nested=nested,
+            scope="all",
+        )
+        for document in payload["documents"]:
+            document["tags"] = []
+        payload["tags"] = []
+        payload["source_digest"] = self.policy_data.snapshot.source_digest
+        return payload
+
+    def _paged_source_documents(
+        self,
+        lane: str,
+        repository: Any,
+        *,
+        query: str = "",
+        limit: int = 100,
+        offset: int = 0,
+        sort: str = "time-desc",
+        tag: str = "",
+        folder: str = "",
+        nested: bool = True,
+        scope: str = "all",
+    ) -> dict[str, object]:
+        """Filter and sort source documents, then materialize only one page.
+
+        Token counts are computed for the page (or for every match when the
+        sort key is the token count). Search still scans document text, but the
+        JSON payload is the requested page.
+        """
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        scope = scope if scope in {"all", "standard", "reflection"} else "all"
+        sort = sort if sort in {
+            "time-desc",
+            "time-asc",
+            "path-asc",
+            "path-desc",
+            "tokens-desc",
+            "tokens-asc",
+            "status",
+        } else "path-asc"
+        folder_path = str(folder or "").replace("\\", "/").strip("/")
+        tag_filter = str(tag or "").strip()
+        tensor_bank = getattr(self, "tensor_bank", None)
+        pages = tuple(getattr(getattr(tensor_bank, "snapshot", None), "pages", ()))
+        compiled_pages = {
+            (str(page.document_id), str(page.reference_digest)): page
+            for page in pages
+            if str(page.lane) == lane
+        }
+        try:
+            compiled_at = float(tensor_bank.path.stat().st_mtime)
+        except (AttributeError, OSError):
+            compiled_at = None
+        reflection_created_at = {
+            str(record.get("document_path")): float(record["created_at"])
+            for record in (
+                getattr(
+                    getattr(self, "reflection_memory_store", None), "list", lambda: []
+                )()
+            )
+            if record.get("document_path") and record.get("created_at") is not None
+        }
+        self._sync_document_categories()
+        category_store = getattr(self, "document_categories", None)
+        category_titles = (
+            {
+                str(category["category_id"]): str(category["title"])
+                for category in category_store.categories()
+            }
+            if category_store is not None
+            else {}
+        )
+        matched: list[tuple[KnowledgeDocument, Any | None]] = []
+        compiled_count = 0
+        uncompiled_count = 0
+        tags: set[str] = set()
+        for document in repository.snapshot.documents:
+            reflection = is_reflection_memory_document(document)
+            if scope == "reflection" and not reflection:
+                continue
+            if scope == "standard" and reflection:
+                continue
+            if not self._document_matches_query(document, query):
+                continue
+            if not self._document_in_folder(document.relative_path, folder_path, nested):
+                continue
+            tags.update(document.tags)
+            if tag_filter and tag_filter not in document.tags:
+                continue
+            compiled_page = compiled_pages.get((document.document_id, document.sha256))
+            if compiled_page is not None:
+                compiled_count += 1
+            else:
+                uncompiled_count += 1
+            matched.append((document, compiled_page))
+
+        def ingested_at(document: KnowledgeDocument) -> float:
+            return float(
+                reflection_created_at.get(
+                    document.relative_path, document.modified_ns / 1_000_000_000
+                )
+            )
+
+        token_counts: dict[str, int] = {}
+        if sort in {"tokens-desc", "tokens-asc"}:
+            for document, compiled_page in matched:
+                token_counts[document.document_id] = self._document_token_count(
+                    document, compiled_page=compiled_page
+                )
+
+        def sort_key(item: tuple[KnowledgeDocument, Any | None]):
+            document, compiled_page = item
+            path = document.relative_path.casefold()
+            if sort in {"time-desc", "time-asc"}:
+                return (ingested_at(document), path)
+            if sort in {"tokens-desc", "tokens-asc"}:
+                return (token_counts.get(document.document_id, 0), path)
+            if sort == "status":
+                return (int(compiled_page is not None), path)
+            return (path,)
+
+        reverse = sort in {"time-desc", "tokens-desc", "path-desc"}
+        matched.sort(key=sort_key, reverse=reverse)
+        page = matched[offset : offset + limit]
+        payloads: list[dict[str, object]] = []
+        for document, compiled_page in page:
+            payload = document.public_dict(include_content=False)
+            payload["retrieval_category_title"] = category_titles.get(
+                str(payload.get("retrieval_category") or payload["source_kind"]),
+                str(payload.get("retrieval_category") or payload["source_kind"]),
+            )
+            token_count = token_counts.get(document.document_id)
+            if token_count is None:
+                token_count = self._document_token_count(
+                    document, compiled_page=compiled_page
+                )
+            payload.update(
+                {
+                    "token_count": token_count,
+                    "compiled": compiled_page is not None,
+                    "compile_status": (
+                        "compiled" if compiled_page is not None else "uncompiled"
+                    ),
+                    "compiled_at": compiled_at if compiled_page is not None else None,
+                    "ingested_at": ingested_at(document),
+                    "updated_at": document.modified_ns / 1_000_000_000,
+                }
+            )
+            payloads.append(payload)
+        return {
+            "documents": payloads,
+            "total": len(matched),
+            "offset": offset,
+            "limit": limit,
+            "compiled_count": compiled_count,
+            "uncompiled_count": uncompiled_count,
+            "tags": sorted(tags, key=str.casefold),
+        }
+
+    @staticmethod
+    def _document_in_folder(relative_path: str, folder: str, nested: bool) -> bool:
+        path = str(relative_path).replace("\\", "/")
+        if not folder:
+            return True if nested else "/" not in path
+        prefix = folder.rstrip("/") + "/"
+        if nested:
+            return path.startswith(prefix)
+        parent, _slash, _name = path.rpartition("/")
+        return parent == folder.rstrip("/")
 
     def knowledge_document(self, relative_path: str) -> dict[str, object]:
         for document in self.knowledge_documents(include_content=True):

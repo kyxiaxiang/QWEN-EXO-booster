@@ -9,7 +9,17 @@ import type {
   HealthStatus,
   ModelCatalog,
   DocumentCategory,
+  DreamRunDetail,
+  DreamStatus,
   KnowledgeDraft,
+  KnowledgeFile,
+  KnowledgeFilePage,
+  KnowledgeMoveResult,
+  KnowledgeReadResponse,
+  KnowledgeSearchResponse,
+  KnowledgeSummaryRecord,
+  KnowledgeSummaryStatus,
+  KnowledgeTree,
   RecallTrace,
   RequestTraceListing,
   PendingReflectionMemory,
@@ -29,6 +39,7 @@ import type {
   TrainingSelectionStatus,
   ServerSessionDeletion,
   ServerSessionListing,
+  WorkTrashEntry,
 } from "@/lib/types";
 import { translate as t } from "@/lib/i18n";
 
@@ -184,13 +195,238 @@ export async function listSources(
   lane: "knowledge" | "policydata",
   query = "",
   signal?: AbortSignal,
+  page?: {
+    limit?: number;
+    offset?: number;
+    sort?: string;
+    tag?: string;
+    folder?: string;
+    nested?: boolean;
+    scope?: "all" | "standard" | "reflection";
+  },
 ) {
   const params = new URLSearchParams();
   if (query.trim()) params.set("q", query.trim());
+  if (page?.limit) params.set("limit", String(page.limit));
+  if (page?.offset) params.set("offset", String(page.offset));
+  if (page?.sort) params.set("sort", page.sort);
+  if (page?.tag) params.set("tag", page.tag);
+  if (page?.folder) params.set("folder", page.folder);
+  if (page?.nested === false) params.set("nested", "false");
+  if (page?.scope && page.scope !== "all") params.set("scope", page.scope);
   const suffix = params.size ? `?${params}` : "";
   return (await (
     await apiFetch(`/${lane}${suffix}`, { signal })
   ).json()) as SourceListing;
+}
+
+export async function listKnowledgeFiles(
+  query: {
+    folder?: string;
+    nested?: boolean;
+    q?: string;
+    area?: "imported" | "work" | "all";
+    limit?: number;
+    offset?: number;
+  } = {},
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams();
+  if (query.folder) params.set("folder", query.folder);
+  params.set("nested", String(query.nested !== false));
+  if (query.q?.trim()) params.set("q", query.q.trim());
+  if (query.area) params.set("area", query.area);
+  params.set("limit", String(query.limit ?? 100));
+  params.set("offset", String(query.offset ?? 0));
+  return (await (
+    await apiFetch(`/knowledge/files?${params}`, { signal })
+  ).json()) as KnowledgeFilePage;
+}
+
+export async function uploadKnowledgeFileRaw(relativePath: string, file: Blob) {
+  return (await (
+    await apiFetch(
+      `/knowledge/upload?${new URLSearchParams({ path: relativePath })}`,
+      {
+        method: "POST",
+        body: file,
+        headers: { "Content-Type": "application/octet-stream" },
+      },
+    )
+  ).json()) as { file: KnowledgeFile };
+}
+
+export async function uploadKnowledgeArchiveRaw(
+  file: Blob,
+  targetDirectory: string,
+) {
+  const params = new URLSearchParams({ target_directory: targetDirectory });
+  return (await (
+    await apiFetch(`/knowledge/upload-archive?${params}`, {
+      method: "POST",
+      body: file,
+      headers: { "Content-Type": "application/octet-stream" },
+    })
+  ).json()) as {
+    files: KnowledgeFile[];
+    skipped: { path: string; reason: string }[];
+  };
+}
+
+export async function deleteKnowledgeFile(relativePath: string) {
+  await apiFetch(`/knowledge/files/${encodeSourcePath(relativePath)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function getKnowledgeTree(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/knowledge/tree", { signal })
+  ).json()) as KnowledgeTree;
+}
+
+export async function createKnowledgeFolder(path: string) {
+  return (await (
+    await apiFetch("/knowledge/folders", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    })
+  ).json()) as { path: string };
+}
+
+export async function deleteKnowledgeFolder(path: string) {
+  return (await (
+    await apiFetch(`/knowledge/folders/${encodeSourcePath(path)}`, {
+      method: "DELETE",
+    })
+  ).json()) as { deleted: boolean; path?: string; files: number };
+}
+
+export async function moveKnowledgeEntry(source: string, destination: string) {
+  return (await (
+    await apiFetch("/knowledge/move", {
+      method: "POST",
+      body: JSON.stringify({ source, destination }),
+    })
+  ).json()) as KnowledgeMoveResult;
+}
+
+export async function getSummaryStatus(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/knowledge/summaries", { signal })
+  ).json()) as KnowledgeSummaryStatus;
+}
+
+export async function getKnowledgeSummary(path: string) {
+  try {
+    return (await (
+      await apiFetch(`/knowledge/summary?${new URLSearchParams({ path })}`)
+    ).json()) as KnowledgeSummaryRecord;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+export async function saveKnowledgeSummary(path: string, summary: string) {
+  return (await (
+    await apiFetch("/knowledge/summary", {
+      method: "PUT",
+      body: JSON.stringify({ path, summary }),
+    })
+  ).json()) as KnowledgeSummaryRecord;
+}
+
+export async function deleteKnowledgeSummary(path: string) {
+  return (await (
+    await apiFetch(`/knowledge/summary?${new URLSearchParams({ path })}`, {
+      method: "DELETE",
+    })
+  ).json()) as { deleted: boolean };
+}
+
+export async function generateKnowledgeSummaries(
+  paths: string[],
+  force = false,
+) {
+  return (await (
+    await apiFetch("/knowledge/summaries/generate", {
+      method: "POST",
+      body: JSON.stringify({ paths, force }),
+    })
+  ).json()) as KnowledgeSummaryStatus;
+}
+
+export async function searchKnowledge(options: {
+  pattern: string;
+  pathGlob?: string;
+  caseSensitive?: boolean;
+  regex?: boolean;
+  maxResults?: number;
+  context?: number;
+}) {
+  const params = new URLSearchParams({
+    pattern: options.pattern,
+    path_glob: options.pathGlob || "**/*",
+    case_sensitive: String(Boolean(options.caseSensitive)),
+    regex: String(Boolean(options.regex)),
+    max_results: String(options.maxResults ?? 200),
+    context_before: String(options.context ?? 1),
+    context_after: String(options.context ?? 1),
+  });
+  return (await (
+    await apiFetch(`/knowledge/search?${params}`)
+  ).json()) as KnowledgeSearchResponse;
+}
+
+export async function getDreamStatus(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/memory/dream", { signal })
+  ).json()) as DreamStatus;
+}
+
+export async function runDream() {
+  return (await (
+    await apiFetch("/memory/dream/run", { method: "POST" })
+  ).json()) as DreamStatus;
+}
+
+export async function getDreamRun(id: number, signal?: AbortSignal) {
+  return (await (
+    await apiFetch(`/memory/dream/runs/${encodeURIComponent(String(id))}`, {
+      signal,
+    })
+  ).json()) as DreamRunDetail;
+}
+
+export async function getWorkTrash(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/memory/work-trash", { signal })
+  ).json()) as { entries: WorkTrashEntry[] };
+}
+
+export async function restoreWorkTrash(batch: string, path: string) {
+  return (await (
+    await apiFetch("/memory/work-trash/restore", {
+      method: "POST",
+      body: JSON.stringify({ batch, path }),
+    })
+  ).json()) as { restored: string };
+}
+
+export async function readKnowledge(
+  path: string,
+  offset = 0,
+  limit = 262_144,
+) {
+  const params = new URLSearchParams({
+    path,
+    offset: String(offset),
+    limit: String(limit),
+  });
+  return (await (
+    await apiFetch(`/knowledge/read?${params}`)
+  ).json()) as KnowledgeReadResponse;
 }
 
 export type ReflectionOrganizationResult = {
